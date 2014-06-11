@@ -1,18 +1,32 @@
 #!/bin/bash
 
 TO="/tmp"
-DIR=`/bin/date +%Y-%m-%d`
-FTPS='frp server'
-FTPU='ftp user'
-FTPP='frp password'
-/usr/bin/lftp -u $FTPU,$FTPP $FTPS -e "mkdir $DIR;quit"
-
-mysql_host=''
-mysql_user=''
-mysql_pass=''
-
+CODE="omsk"
+DIR=`/bin/date +$CODE/%Y-%m-%d/%H-%M`
 LOGDATE=`/bin/date +%Y-%m-%d-%H-%M-%S`
 LOG=$TO/backup_$LOGDATE.log
+
+#FTP
+    FTPU='user'
+    FTPP='password'
+    FTPS='host'
+    /usr/bin/lftp -u $FTPU,$FTPP $FTPS -e "mkdir $DIR;quit"
+
+#PostgreSQL
+    pgu=user
+    pgp='password'
+
+#SSH
+    sshu='user'
+    sshp='password'
+    sshs='host'
+    sshd='/var/backups'
+    sshpass -p $sshp ssh $sshu:$sshp@$sshs mkdir -p $sshd/$DIR
+
+# MySQL
+    mysql_host='host'
+    mysql_user='user'
+    mysql_pass='password'
 
 function startTimer() {
     STARTTIME=$(date +%s)
@@ -36,11 +50,15 @@ function log() {
 }
 
 function sendLog() {
-    sendFile2ftp $LOG
+    sendFile2ssh $LOG
 }
 
 function sendFile2ftp() {
     /usr/bin/lftp -u $FTPU,$FTPP $FTPS -e "cd $DIR;mput $1;quit"
+}
+
+function sendFile2ssh() {
+    sshpass -p $sshp scp $1 -r $sshu@$sshs:$sshd/$DIR/
 }
 
 function backupDir() {
@@ -58,13 +76,19 @@ function backupDir() {
 
     # 3) send to FTP
     startTimer
-    sendFile2ftp $COMPRESSED
+    sendFile2ssh $COMPRESSED
     E=$(getElapsed)
     log "$E\tsent to ftp\n"
 
     # 4) remove compressed file
     /bin/rm $COMPRESSED
 
+}
+
+function backupDirRecv() {
+    for f in $1/*; do
+	backupDir $(basename "$f") $f
+    done;
 }
 
 function backupMysql() {
@@ -91,14 +115,83 @@ function backupMysql() {
 
 }
 
+function backupPgsqlRecv() {
+    
+    # 1) preparing
+    PGPASSWORD=$pgp
+    export PGPASSWORD
+
+    # 2) get databases list
+    DBS="$(psql -U $pgu -lt |awk '{ print $1}' |grep -vE '^-|^List|^Name|template[0|1]')"
+
+    for db in $DBS
+    do
+	if [ "$db" != '|' ]; then
+	    
+	    # 3) dump DB
+	    startTimer
+	    DATE=`/bin/date +%Y%m%d-%H%M`
+	    COMPRESSED=$TO/pgsql_$db\_$DATE.sql.gz
+    	    pg_dump -U $pgu $db | gzip -c > $COMPRESSED
+	    E=$(getElapsed)
+	    log "$E\tpgsql dump $db to $COMPRESSED"
+	    
+	    # 4) send to backup server
+	    startTimer
+	    sendFile2ssh $COMPRESSED
+	    E=$(getElapsed)
+	    log "$E\tsent to backup server\n"
+	    
+	    # 5) remove compressed file
+	    /bin/rm $COMPRESSED
+
+	fi
+    done
+
+    # 6) finalize
+    PGPASSWORD=
+    export PGPASSWORD
+
+}
+
+function backupMongoDb() {
+
+    # 1) preparing
+    DATE=`/bin/date +%Y%m%d-%H%M`
+    OUT_DIR=$TO/mongodb_$DATE
+
+    # 2) dump DB
+    startTimer
+    mongodump -h $1 -out $OUT_DIR
+    E=$(getElapsed)
+    log "$E\tmongodb dump $4 to directory $OUT_DIR"
+
+    backupDirRecv $OUT_DIR
+
+    # 4) remove directory
+    /bin/rm -r -f $OUT_DIR
+
+}
+
 log "start\n"
+
 backupDir apache2 /etc/apache2
 backupDir nginx /etc/nginx
 backupDir network /etc/network
 backupDir php5 /etc/php5
+
+backupMongoDb 127.0.0.1
+
+# Store all DB to separated archive
+backupPgsqlRecv
+
+# Store all directories to separated archive
+backupDirRecv /var/www
+
 # backupMysql  $mysql_host $mysql_user $mysql_pass --all_databases
 backupMysql  $mysql_host $mysql_user $mysql_pass sales
 backupMysql  $mysql_host $mysql_user $mysql_pass mysql
 backupMysql  $mysql_host $mysql_user $mysql_pass redmine
 backupMysql  $mysql_host $mysql_user $mysql_pass information_schema
+
 sendLog
